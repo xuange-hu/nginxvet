@@ -61,9 +61,12 @@ jobs:
           server_tokens on;
           autoindex on;
           EOF
-          nginxvet scan /tmp/clean.conf --fail-on high
-          if nginxvet scan /tmp/bad.conf --fail-on high > /dev/null; then
-            echo "::error::bad.conf should exit 1 at --fail-on high"
+          # server_tokens on / autoindex on are MEDIUM in this rulebook, so the
+          # gate threshold must be medium (a copied `high` from sibling repos
+          # never fires). clean.conf has zero findings at any threshold.
+          nginxvet scan /tmp/clean.conf --fail-on medium
+          if nginxvet scan /tmp/bad.conf --fail-on medium > /dev/null; then
+            echo "::error::bad.conf should exit 1 at --fail-on medium"
             exit 1
           fi
           echo "gate contract ok (clean=0, bad=1)"
