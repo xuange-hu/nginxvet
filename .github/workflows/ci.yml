@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (zero runtime dependencies)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest ruff
+          python -c "import sys; print('third-party loaded:', [m for m in sys.modules if m in ('yaml','click','rich','mcp','requests')])"
+
+      - name: Tests
+        run: python -m pytest -q -o addopts=
+
+      - name: Ruff
+        run: python -m ruff check .
+
+      - name: CLI smoke
+        run: |
+          nginxvet --version
+          nginxvet rules | head -3
+          nginxvet demo --quiet | tail -3
+          printf 'server { server_name example.com; add_header Strict-Transport-Security x always; location /api/ { add_header X-Debug 1; } }' > /tmp/effective.conf
+          nginxvet effective example.com /tmp/effective.conf --location /api/x
+
+      - name: Demo covers every rule
+        run: |
+          python -c "from nginxvet.demo import run_demo; from nginxvet.rules import REGISTRY; fired={f.rule for f in run_demo().findings}; missing=sorted({r.id for r in REGISTRY}-fired); assert not missing, missing; print('demo fires', len(fired), 'rules')"
+
+      - name: Exit-code gate contract
+        run: |
+          cat > /tmp/clean.conf <<'EOF'
+          server_tokens off;
+          autoindex off;
+          gzip off;
+          EOF
+          cat > /tmp/bad.conf <<'EOF'
+          server_tokens on;
+          autoindex on;
+          EOF
+          nginxvet scan /tmp/clean.conf --fail-on high
+          if nginxvet scan /tmp/bad.conf --fail-on high > /dev/null; then
+            echo "::error::bad.conf should exit 1 at --fail-on high"
+            exit 1
+          fi
+          echo "gate contract ok (clean=0, bad=1)"
+
+      - name: MCP manifest check
+        run: |
+          python -m pip install "mcp>=1.2,<2"
+          python - <<'PY'
+          import asyncio
+          from nginxvet.mcp_server import build_server, tool_manifest
+          tools = asyncio.run(build_server().list_tools())
+          assert len(tools) == 6, f"expected 6 MCP tools, got {len(tools)}"
+          assert all(tool.description for tool in tools), "empty tool description"
+          assert {t.name for t in tools} == {e["name"] for e in tool_manifest()}, "MCP tools drifted from the manifest"
+          print(f"mcp tools ok: {len(tools)}")
+          PY
+
+      - name: Zero third-party import guard
+        run: |
+          python - <<'PY'
+          import subprocess, sys, os
+          env = dict(os.environ)
+          env["PYTHONPATH"] = "src"
+          out = subprocess.run(
+              [sys.executable, "-c",
+               "import sys; before=set(sys.modules); import nginxvet, nginxvet.cli, nginxvet.rules; "
+               "third=[m for m in set(sys.modules)-before if m in ('yaml','click','rich','mcp','requests')]; "
+               "assert not third, third; print('core import guard ok')"],
+              capture_output=True, text=True, env=env, check=True,
+          )
+          print(out.stdout.strip())
+          PY
+
+  fresh-clone:
+    # A visitor's first `git clone && pip install . && pytest` must work with
+    # only base deps installed -- no extras, no editable path tricks.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Fresh install and collect
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pytest
+          cd "$(mktemp -d)"
+          python -m pytest "$GITHUB_WORKSPACE/tests" --collect-only -q
+
+  badge-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install with optional test deps
+        run: python -m pip install -e ".[mcp]" pytest
+      - name: README test-count badges vs pytest collection
+        run: |
+          # -o addopts= neutralises a project-level addopts="-q": with the -q below
+          # it becomes -qq and pytest -qq drops the "N tests collected" line.
+          actual=$(python -m pytest --collect-only -q -o addopts= 2>/dev/null | grep -oE "[0-9]+ tests? collected" | grep -oE "^[0-9]+" || true)
+          echo "collected=${actual:-NOTHING}"
+          if [ -z "$actual" ]; then
+            echo "::error::pytest collected nothing - the badge check did not run"
+            exit 1
+          fi
+          for readme in README.md README_CN.md; do
+            claimed=$(grep -oE "tests-[0-9]+" "$readme" | grep -oE "[0-9]+" | head -1 || true)
+            echo "$readme claims=${claimed:-NONE}"
+            if [ "$actual" != "$claimed" ]; then
+              echo "::error::$readme badge says $claimed but pytest collects $actual"
+              exit 1
+            fi
+          done
+          echo "badges ok ($actual)"
